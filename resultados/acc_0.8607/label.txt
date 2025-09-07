@@ -2,7 +2,7 @@
 python .\centernet_light_helmet.py --images dataset/images/train --labels dataset/labels/train --val-images dataset/images/val --val-labels dataset/labels/val
 
 epochs default=30
-batch default=16
+batch default=8
 
 === RESULTADOS FINAIS ===
 Imagens avaliadas: 2455
