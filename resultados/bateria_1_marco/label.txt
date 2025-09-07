@@ -1,0 +1,19 @@
+# comando
+python centernet_light_helmet.py --images dataset/images/train --labels dataset/labels/train --val-images dataset/images/val --val-labels dataset/labels/val --lr 2e-4 --batch 8 --norm bn --freeze-bn --grad-clip 0.5 --patience 15
+
+--lr 2e-4
+--batch 8
+--norm bn
+--freeze-bn
+--grad-clip 0.5
+--patience 15
+
+val_loss: 1.6841
+
+=== RESULTADOS FINAIS ===
+Imagens avaliadas: 2455
+TP=4315 FP=2382 FN=2434
+Precisão (P) : 0.6443
+Recall   (R) : 0.6394
+F1-score    : 0.6418
+Acurácia por PRESENÇA (prediz 'tem capacete' vs 'não tem'): 0.8684
