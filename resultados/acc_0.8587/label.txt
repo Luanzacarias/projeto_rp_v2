@@ -1,0 +1,15 @@
+# comando
+python .\centernet_light_helmet.py --images dataset/images/train --labels dataset/labels/train --val-images dataset/images/val --val-labels dataset/labels/val
+
+epochs default=30
+batch default=8
+
+rodou 19 epochs (parei, dando nan)
+
+=== RESULTADOS FINAIS ===
+Imagens avaliadas: 2455
+TP=4457 FP=2340 FN=2292
+Precisão (P) : 0.6557
+Recall   (R) : 0.6604
+F1-score    : 0.6581
+Acurácia por PRESENÇA (prediz 'tem capacete' vs 'não tem'): 0.8587
