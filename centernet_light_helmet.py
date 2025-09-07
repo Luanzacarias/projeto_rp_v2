@@ -1,4 +1,3 @@
-# centernet_light_helmet.py (treino + validação, early stopping, AMP novo, checkpoint, precisão)
 import os
 import math
 import random
@@ -44,11 +43,9 @@ def targets_to_boxes(wh, reg, mask, down=16):
     rx = reg[0, ys, xs]
     ry = reg[1, ys, xs]
 
-    # centro (em células) + regressão
     xs_f = xs.float() + rx
     ys_f = ys.float() + ry
 
-    # para pixels
     x1 = (xs_f - bw/2) * down
     y1 = (ys_f - bh/2) * down
     x2 = (xs_f + bw/2) * down
@@ -102,7 +99,7 @@ def focal_loss(pred, gt):
     return loss
 
 # ------------------------
-# Dataset: images + YOLO txt -> alvos CenterNet
+# Dataset: YOLO txt -> alvos CenterNet (com sanitização)
 # ------------------------
 class YoloToCenterNetDataset(Dataset):
     def __init__(self, images_dir, labels_dir, img_size=512, down=16, transform=None):
@@ -128,7 +125,6 @@ class YoloToCenterNetDataset(Dataset):
         img = cv2.resize(img, (self.img_size, self.img_size))
         img = img.astype(np.float32) / 255.0
 
-        # targets
         num_classes = 1
         heatmap = np.zeros((num_classes, self.out_size, self.out_size), dtype=np.float32)
         wh = np.zeros((2, self.out_size, self.out_size), dtype=np.float32)
@@ -142,13 +138,30 @@ class YoloToCenterNetDataset(Dataset):
                     if not line:
                         continue
                     parts = line.split()
-                    cls = 0  # uma classe
-                    xc = float(parts[1]) * self.img_size
-                    yc = float(parts[2]) * self.img_size
-                    bw = float(parts[3]) * self.img_size
-                    bh = float(parts[4]) * self.img_size
+                    if len(parts) < 5:
+                        continue
+                    # leitura robusta
+                    try:
+                        xc_n = float(parts[1]); yc_n = float(parts[2])
+                        bw_n = float(parts[3]); bh_n = float(parts[4])
+                    except ValueError:
+                        continue
+                    # clamp para [0,1]
+                    xc_n = min(max(xc_n, 0.0), 1.0)
+                    yc_n = min(max(yc_n, 0.0), 1.0)
+                    bw_n = min(max(bw_n, 0.0), 1.0)
+                    bh_n = min(max(bh_n, 0.0), 1.0)
+                    # descarta degeneradas / NaN/Inf
+                    if not np.isfinite([xc_n, yc_n, bw_n, bh_n]).all():
+                        continue
+                    if bw_n <= 0 or bh_n <= 0:
+                        continue
 
-                    # para o mapa de saída
+                    xc = xc_n * self.img_size
+                    yc = yc_n * self.img_size
+                    bw = bw_n * self.img_size
+                    bh = bh_n * self.img_size
+
                     xc_o = xc / self.down
                     yc_o = yc / self.down
                     bw_o = bw / self.down
@@ -157,10 +170,9 @@ class YoloToCenterNetDataset(Dataset):
                     ct = np.array([xc_o, yc_o])
                     ct_int = ct.astype(np.int32)
 
-                    # raio gaussiano
                     radius = gaussian_radius((math.ceil(bh_o), math.ceil(bw_o)))
                     radius = max(0, int(radius))
-                    draw_gaussian(heatmap[cls], ct_int, radius)
+                    draw_gaussian(heatmap[0], ct_int, radius)
 
                     x_i, y_i = ct_int[0], ct_int[1]
                     if 0 <= x_i < self.out_size and 0 <= y_i < self.out_size:
@@ -173,7 +185,7 @@ class YoloToCenterNetDataset(Dataset):
         img_t = torch.from_numpy(img).permute(2,0,1).float()
         return img_t, torch.from_numpy(heatmap).float(), torch.from_numpy(wh).float(), torch.from_numpy(reg).float(), torch.from_numpy(reg_mask).float()
 
-# gaussian radius helper usado no CenterNet
+# gaussian radius helper
 def gaussian_radius(det_size, min_overlap=0.7):
     height, width = det_size
     a1  = 1
@@ -198,23 +210,27 @@ def gaussian_radius(det_size, min_overlap=0.7):
 # ------------------------
 # Modelo
 # ------------------------
-class ConvBNReLU(nn.Module):
-    def __init__(self, in_c, out_c, k=3, s=1, p=1):
+class ConvNormReLU(nn.Module):
+    def __init__(self, in_c, out_c, k=3, s=1, p=1, norm='bn'):
         super().__init__()
         self.conv = nn.Conv2d(in_c, out_c, k, stride=s, padding=p, bias=False)
-        self.bn = nn.BatchNorm2d(out_c)
+        if norm == 'gn':
+            groups = min(32, out_c) if out_c >= 8 else 1
+            self.norm = nn.GroupNorm(num_groups=groups, num_channels=out_c)
+        else:
+            self.norm = nn.BatchNorm2d(out_c)
         self.act = nn.ReLU(inplace=True)
     def forward(self,x):
-        return self.act(self.bn(self.conv(x)))
+        return self.act(self.norm(self.conv(x)))
 
 class SimpleBackbone(nn.Module):
-    def __init__(self):
+    def __init__(self, norm='bn'):
         super().__init__()
-        self.stem = ConvBNReLU(3,64,3,2,1)   # /2
-        self.l1 = ConvBNReLU(64,128,3,2,1)   # /4
-        self.l2 = ConvBNReLU(128,256,3,2,1)  # /8
-        self.l3 = ConvBNReLU(256,512,3,2,1)  # /16
-        self.reduce = ConvBNReLU(512,256,1,1,0)
+        self.stem = ConvNormReLU(3,64,3,2,1,norm)   # /2
+        self.l1 = ConvNormReLU(64,128,3,2,1,norm)   # /4
+        self.l2 = ConvNormReLU(128,256,3,2,1,norm)  # /8
+        self.l3 = ConvNormReLU(256,512,3,2,1,norm)  # /16
+        self.reduce = ConvNormReLU(512,256,1,1,0,norm)
 
     def forward(self,x):
         x = self.stem(x)
@@ -225,19 +241,19 @@ class SimpleBackbone(nn.Module):
         return x
 
 class CenterNetLight(nn.Module):
-    def __init__(self, num_classes=1):
+    def __init__(self, num_classes=1, norm='bn'):
         super().__init__()
-        self.backbone = SimpleBackbone()
+        self.backbone = SimpleBackbone(norm=norm)
         self.hm_head = nn.Sequential(
-            ConvBNReLU(256,128,3,1,1),
+            ConvNormReLU(256,128,3,1,1,norm),
             nn.Conv2d(128, num_classes, 1)
         )
         self.wh_head = nn.Sequential(
-            ConvBNReLU(256,128,3,1,1),
+            ConvNormReLU(256,128,3,1,1,norm),
             nn.Conv2d(128, 2, 1)
         )
         self.reg_head = nn.Sequential(
-            ConvBNReLU(256,128,3,1,1),
+            ConvNormReLU(256,128,3,1,1,norm),
             nn.Conv2d(128, 2, 1)
         )
 
@@ -260,14 +276,15 @@ def decode_heatmap(hm, wh, reg, K=100, down=16):
     inds = inds.view(batch, K)
     xs = (inds % W).float()
     ys = (inds // W).float()
-    # gather wh/reg
+
     wh = wh.reshape(batch, 2, -1)
     reg = reg.reshape(batch, 2, -1)
     wh_k = torch.stack([wh[:,0,:].gather(1, inds), wh[:,1,:].gather(1, inds)], dim=-1)  # B,K,2
     reg_k = torch.stack([reg[:,0,:].gather(1, inds), reg[:,1,:].gather(1, inds)], dim=-1)
+
     xs = xs + reg_k[...,0]
     ys = ys + reg_k[...,1]
-    # convert to boxes
+
     x1 = (xs - wh_k[...,0]/2) * down
     y1 = (ys - wh_k[...,1]/2) * down
     x2 = (xs + wh_k[...,0]/2) * down
@@ -289,10 +306,11 @@ def compute_losses(hm_pred, wh_pred, reg_pred, hms, whs, regs, masks, device):
         loss_wh = torch.tensor(0.0, device=device)
         loss_reg = torch.tensor(0.0, device=device)
     loss = loss_hm + 0.1*loss_wh + 1.0*loss_reg
-    return loss, {'hm': loss_hm.item(), 'wh': loss_wh.item(), 'reg': loss_reg.item()}
+    return loss, {'hm': float(loss_hm.detach().cpu()), 'wh': float(loss_wh.detach().cpu()), 'reg': float(loss_reg.detach().cpu())}
 
 @torch.no_grad()
 def validate(model, loader, device, amp=False, iou_thr=0.5, score_thr=0.3, topk=100, down=16):
+    """Validação: loss médio e precisão (TP/(TP+FP)) com matching greedy por IoU."""
     model.eval()
     val_loss = 0.0
     hm_loss = 0.0
@@ -308,14 +326,19 @@ def validate(model, loader, device, amp=False, iou_thr=0.5, score_thr=0.3, topk=
         regs = regs.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
 
-        with torch.amp.autocast(device_type=device.type, enabled=(amp and device.type=="cuda")):
+        # AMP opcional também pode ser usado em validação, mas sem GradScaler
+        with torch.amp.autocast(device_type=device.type, enabled=(amp and device.type == "cuda")):
             hm_pred, wh_pred, reg_pred = model(imgs)
             loss, parts = compute_losses(hm_pred, wh_pred, reg_pred, hms, whs, regs, masks, device)
 
-        val_loss += loss.item()
-        hm_loss += parts['hm']
-        wh_loss += parts['wh']
-        reg_loss += parts['reg']
+        # checagem de finitude do loss
+        if isinstance(loss, torch.Tensor) and not torch.isfinite(loss).all():
+            continue
+
+        val_loss += float(loss.detach().cpu())
+        hm_loss  += float(parts['hm'])
+        wh_loss  += float(parts['wh'])
+        reg_loss += float(parts['reg'])
 
         # precisão (greedy IoU)
         boxes_pred, scores_pred = decode_heatmap(hm_pred, wh_pred, reg_pred, K=topk, down=down)  # [B,K,4], [B,K]
@@ -328,7 +351,7 @@ def validate(model, loader, device, amp=False, iou_thr=0.5, score_thr=0.3, topk=
             boxes_b = boxes_pred[b][keep]
             scores_b = scores_b[keep]
 
-            gt_b = targets_to_boxes(whs[b], regs[b], masks[b], down=down)  # [N,4]
+            gt_b = targets_to_boxes(whs[b], regs[b], masks[b], down=down)
             order = torch.argsort(scores_b, descending=True)
             boxes_b = boxes_b[order]
 
@@ -336,7 +359,7 @@ def validate(model, loader, device, amp=False, iou_thr=0.5, score_thr=0.3, topk=
                 total_fp += boxes_b.shape[0]
                 continue
 
-            iou = box_iou_matrix(boxes_b, gt_b)  # [M, N]
+            iou = box_iou_matrix(boxes_b, gt_b)
             matched_gt = torch.zeros(gt_b.shape[0], dtype=torch.bool, device=device)
             tp = 0
             for i in range(boxes_b.shape[0]):
@@ -348,30 +371,48 @@ def validate(model, loader, device, amp=False, iou_thr=0.5, score_thr=0.3, topk=
             total_tp += int(tp)
             total_fp += int(fp)
 
-    n = len(loader)
+    n = max(1, len(loader))
     precision = (total_tp / (total_tp + total_fp)) if (total_tp + total_fp) > 0 else 0.0
     return {
-        'loss': val_loss / max(1, n),
-        'hm': hm_loss / max(1, n),
-        'wh': wh_loss / max(1, n),
-        'reg': reg_loss / max(1, n),
+        'loss': val_loss / n,
+        'hm': hm_loss / n,
+        'wh': wh_loss / n,
+        'reg': reg_loss / n,
         'precision': precision
     }
 
-def train(model, train_loader, val_loader, optimizer, device, epochs=30, amp=True, grad_clip=1.0, scheduler=None, patience=10, outdir="weights", down=16):
+# ------------------------
+# BN helpers
+# ------------------------
+def freeze_bn_stats(module):
+    if isinstance(module, nn.BatchNorm2d):
+        module.eval()
+        for p in module.parameters():
+            p.requires_grad = False
+
+# ------------------------
+# Treino
+# ------------------------
+def train(model, train_loader, val_loader, optimizer, device, epochs=30, amp=True,
+          grad_clip=0.5, scheduler=None, patience=10, outdir="weights", down=16,
+          iou_thr=0.5, score_thr=0.3, topk=100, freeze_bn=False):
+    """Treino com AMP (opcional), nan-guards, grad clipping e early stopping (corrigido)."""
     model.to(device)
-    # novo GradScaler API
-    scaler = torch.amp.GradScaler(enabled=(amp and device.type=="cuda"))
+    scaler = torch.amp.GradScaler(enabled=(amp and device.type == "cuda"))
     best_val = float('inf')
     patience_ctr = 0
 
+    if freeze_bn:
+        model.apply(freeze_bn_stats)
+
     os.makedirs(outdir, exist_ok=True)
 
-    for epoch in range(1, epochs+1):
+    for epoch in range(1, epochs + 1):
         model.train()
         running = 0.0
         steps = 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
+
         for imgs, hms, whs, regs, masks in pbar:
             imgs = imgs.to(device, non_blocking=True)
             hms = hms.to(device, non_blocking=True)
@@ -382,43 +423,93 @@ def train(model, train_loader, val_loader, optimizer, device, epochs=30, amp=Tru
             optimizer.zero_grad(set_to_none=True)
 
             if amp and device.type == "cuda":
+                # ----- RAMO COM AMP -----
                 with torch.amp.autocast(device_type=device.type, enabled=True):
                     hm_pred, wh_pred, reg_pred = model(imgs)
                     loss, _ = compute_losses(hm_pred, wh_pred, reg_pred, hms, whs, regs, masks, device)
+
+                # checagem de finitude do loss (ANTES de qualquer scale/backward)
+                if not torch.isfinite(loss).all():
+                    print("[WARN] loss não finito; pulando batch.")
+                    # NÃO chamar scaler.update() aqui (nenhum inf check foi registrado)
+                    continue
+
+                # backward com escala
                 scaler.scale(loss).backward()
+
+                # desescalar para poder clipar e inspecionar grads
+                scaler.unscale_(optimizer)
+
+                # checa gradientes não finitos
+                bad_grads = 0
+                for p in model.parameters():
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        bad_grads += 1
+                if bad_grads > 0:
+                    print(f"[WARN] gradientes não finitos em {bad_grads} tensores; pulando step.")
+                    optimizer.zero_grad(set_to_none=True)
+                    # AQUI PODE chamar update(), pq houve unscale_ (inf check registrado)
+                    scaler.update()
+                    continue
+
+                # grad clipping
                 if grad_clip is not None:
-                    scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
                 scaler.step(optimizer)
                 scaler.update()
+
             else:
+                # ----- RAMO SEM AMP (CPU ou --no-amp) -----
                 hm_pred, wh_pred, reg_pred = model(imgs)
                 loss, _ = compute_losses(hm_pred, wh_pred, reg_pred, hms, whs, regs, masks, device)
+
+                if not torch.isfinite(loss).all():
+                    print("[WARN] loss não finito; pulando batch.")
+                    continue
+
                 loss.backward()
+
+                bad_grads = 0
+                for p in model.parameters():
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        bad_grads += 1
+                if bad_grads > 0:
+                    print(f"[WARN] gradientes não finitos em {bad_grads} tensores; pulando step.")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+
                 if grad_clip is not None:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
                 optimizer.step()
 
-            running += loss.item()
+            running += float(loss.detach().cpu())
             steps += 1
             pbar.set_postfix(loss=f"{running/steps:.4f}")
 
-        # validação
+        # ---- Validação ----
         val_stats = validate(
             model, val_loader, device,
-            amp=amp, iou_thr=0.5, score_thr=0.3, topk=100, down=down
+            amp=amp, iou_thr=iou_thr, score_thr=score_thr, topk=topk, down=down
         )
+
+        # ---- Scheduler ----
         if scheduler is not None:
-            scheduler.step(val_stats['loss'] if hasattr(scheduler, 'optimizer') else None)
+            # ReduceLROnPlateau precisa da métrica; os demais (Cosine/Step/OneCycle) não
+            if scheduler.__class__.__name__ == "ReduceLROnPlateau":
+                scheduler.step(val_stats['loss'])
+            else:
+                scheduler.step()
 
         print(
-            f"Epoch {epoch}: train_loss={running/len(train_loader):.4f} | "
+            f"Epoch {epoch}: train_loss={running/max(1,len(train_loader)):.4f} | "
             f"val_loss={val_stats['loss']:.4f} "
             f"(hm={val_stats['hm']:.4f}, wh={val_stats['wh']:.4f}, reg={val_stats['reg']:.4f}) | "
-            f"val_precision@IoU0.50,score{0.3:.2f}={val_stats['precision']:.4f}"
+            f"val_precision@IoU{iou_thr:.2f},score{score_thr:.2f}={val_stats['precision']:.4f}"
         )
 
-        # checkpoint do melhor
+        # ---- Checkpoint / Early stopping ----
         if val_stats['loss'] < best_val - 1e-6:
             best_val = val_stats['loss']
             patience_ctr = 0
@@ -475,12 +566,21 @@ if __name__ == "__main__":
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--imgsize", type=int, default=640)
     parser.add_argument("--down", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=3e-4)  # um pouco menor por padrão
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--no-amp", action="store_true", help="desativa mixed precision (AMP)")
     parser.add_argument("--patience", type=int, default=10, help="early stopping patience (épocas sem melhorar)")
     parser.add_argument("--outdir", type=str, default="weights")
+
+    # novas flags
+    parser.add_argument("--norm", type=str, default="bn", choices=["bn","gn"], help="tipo de normalização (bn ou gn)")
+    parser.add_argument("--freeze-bn", action="store_true", help="congela estatísticas/params de BatchNorm")
+    parser.add_argument("--grad-clip", type=float, default=0.5, help="clip de norma de gradiente (None para desativar)")
+    parser.add_argument("--iou-thr", type=float, default=0.5, help="IoU para contagem de TP (validação)")
+    parser.add_argument("--score-thr", type=float, default=0.3, help="limiar de score para considerar predição (validação)")
+    parser.add_argument("--topk", type=int, default=100, help="K do top-k no decode (validação)")
+
     args = parser.parse_args()
 
     # Seeds
@@ -503,7 +603,7 @@ if __name__ == "__main__":
         )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = CenterNetLight(num_classes=1)
+    model = CenterNetLight(num_classes=1, norm=args.norm)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.epochs))
 
@@ -515,11 +615,15 @@ if __name__ == "__main__":
           device,
           epochs=args.epochs,
           amp=(not args.no_amp),
-          grad_clip=1.0,
+          grad_clip=(None if args.grad_clip is None or args.grad_clip <= 0 else args.grad_clip),
           scheduler=scheduler,
           patience=args.patience,
           outdir=args.outdir,
-          down=args.down)
+          down=args.down,
+          iou_thr=args.iou_thr,
+          score_thr=args.score_thr,
+          topk=args.topk,
+          freeze_bn=args.freeze_bn)
 
     # Salva último estado (o melhor já foi salvo como best.pth)
     os.makedirs(args.outdir, exist_ok=True)
