@@ -1,0 +1,15 @@
+python .\centernet_light_helmet.py --images dataset/images/train --labels dataset/labels/train --val-images dataset/images/val --val-labels dataset/labels/val --batch 24 --no-amp
+
+Melhor val_loss: 2.2037
+
+epochs default=30
+batch default=24
+
+
+=== RESULTADOS FINAIS ===
+Imagens avaliadas: 2455
+TP=4286 FP=2669 FN=2463
+Precisão (P) : 0.6162
+Recall   (R) : 0.6351
+F1-score    : 0.6255
+Acurácia por PRESENÇA (prediz 'tem capacete' vs 'não tem'): 0.8635

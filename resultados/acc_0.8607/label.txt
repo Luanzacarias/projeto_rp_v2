@@ -4,6 +4,8 @@ python .\centernet_light_helmet.py --images dataset/images/train --labels datase
 epochs default=30
 batch default=8
 
+loss = 1.6611
+
 === RESULTADOS FINAIS ===
 Imagens avaliadas: 2455
 TP=4329 FP=2119 FN=2420

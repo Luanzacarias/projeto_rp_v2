@@ -1,0 +1,4 @@
+
+
+
+Melhor val_loss: 1.4839
